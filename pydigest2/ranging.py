@@ -1,360 +1,166 @@
-"""The adaptive Monte-Carlo orbit search: digest2's actual algorithm.
+"""Scoring driver: motion vector -> orbit search -> class percentages.
 
-Ported from ``d2math.c``: ``tagAngle``, ``aRange``, ``solveAngleRange``,
-``searchAngles``, ``offsetMotionVector``, ``setupDistanceDependentVectors``,
-``searchDistance``, ``dRange``, and the final score computation in
-``score()``.
+Ports ``d2math.c``'s ``score()`` -- the function that sets up the two
+observation vectors, runs the adaptive orbit search over distance and
+angle, and turns the resulting tagged-bin population sums into the raw
+and no-ID percentages.
 
-Why this is scalar Python, not NumPy, per tracklet
-----------------------------------------------------
-This is a *data-dependent recursive* search: at each node, whether (and
+The search itself -- the ~95% of runtime that is ``dRange`` /
+``searchDistance`` / ``aRange`` / ``tagAngle`` and friends -- lives in
+:mod:`pydigest2._search`, written once as a buffer-based kernel. This
+module picks how to run it:
+
+* If **numba** is installed, the kernel is JIT-compiled (``njit``,
+  ``nogil``) and fed NumPy buffers. This is roughly an order of
+  magnitude faster than interpreting it, and because it releases the
+  GIL, :mod:`pydigest2.engine` can then parallelize with threads
+  instead of processes.
+* Otherwise the exact same function runs as ordinary Python, fed plain
+  lists (which index faster than NumPy scalars do in the interpreter).
+
+numba is an optional extra, never required: ``pip install
+pydigest2[fast]``. Both paths run the same source, so they cannot
+drift; ``tests/test_kernel.py`` asserts they produce identical scores.
+
+Why the search can't just be vectorized with NumPy instead
+-----------------------------------------------------------
+It is a *data-dependent recursive* search: at each node, whether (and
 in what order) the two halves get explored depends on whether the
-midpoint orbit lands in a previously untagged model bin -- and in
-"repeatable" mode, that midpoint itself is jittered by a per-tracklet
-LCG stream that must be consumed in exactly this recursion's call
-order to reproduce the reference program's bin selection. That rules
-out batching a single tracklet's search into flat NumPy array ops:
-there is no fixed set of "steps" to vectorize over, and reordering
-calls would desync the RNG.
-
-What *is* embarrassingly parallel is the tracklet dimension: every
-tracklet's search is fully independent (its own LCG state, its own
-per-class tag sets), and a real input file scores thousands of them.
-That's where this package gets its throughput -- see
-:mod:`pydigest2.engine`, which fans this function out across
-processes -- while the handful of 3-vector ops in one search node stay
-plain Python floats/tuples, which for objects this small outrun NumPy's
-per-call array overhead by roughly an order of magnitude.
+midpoint orbit lands in a previously untagged model bin -- and that
+midpoint is jittered by an LCG whose draws must be consumed in exactly
+this traversal order to reproduce the reference program's bin
+selection. There is no fixed set of "steps" to batch across, and
+reordering the calls would desync the RNG. The parallelism that *is*
+available is across tracklets, which are fully independent of one
+another; see :mod:`pydigest2.engine`.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from math import acos, atan2, cos, degrees, exp, log10, pi, sin, sqrt
-from typing import List, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass
+from math import cos, sin, sqrt
+from typing import Sequence
 
-from .binning import h_to_bin, qei_to_bin
-from .classes import CLASS_TESTS
+import numpy as np
+
+from ._search import search_all as _search_all_py  # noqa: F401  (used by tests/test_kernel.py)
 from .constants import (
-    AGE_LIMIT, ARCSEC_RAD, INV_K, MAX_DISTANCE, MIN_ANGLE_STEP,
-    MIN_DISTANCE, MIN_DISTANCE_STEP, U,
+    ARCSEC_RAD, EPART, EX, HPART, HX, IPART, IX, QPART, QX,
 )
-from .geometry import Vec3, cross3, dot3, ec_rotate, lst, se2000, sub3
+from .geometry import ec_rotate, lst, se2000, sub3
 from .model import Model
 from .obscodes import SiteTable, parse_cod3
 from .observations import Observation
-from .rng import Lcg
 from .tracklet import clip_err, two_obs
 
-BinKey = Tuple[int, int, int, int]
+N_BINS = QX * EX * IX * HX
 
-import sys
-if sys.getrecursionlimit() < 2000:
-    sys.setrecursionlimit(2000)  # comfortable headroom over observed search depths
+# Stack depths for the two explicit search stacks. Both recursions halve
+# their interval each level and stop once it stops yielding new bins, so
+# real depths are small (the C implementation runs its worker threads on
+# 8 KB stacks); these are generous and the kernel raises rather than
+# silently truncating if one were ever hit.
+_ANGLE_STACK = 4096
+_DISTANCE_STACK = 512
 
+try:  # optional accelerator
+    from numba import njit as _njit
+except ImportError:  # pragma: no cover - exercised by whichever env lacks numba
+    _search_all = _search_all_py
+    KERNEL_BACKEND = "python"
+else:
+    _search_all = _njit(cache=True, nogil=True)(_search_all_py)
+    KERNEL_BACKEND = "numba"
 
-@dataclass
-class PerClass:
-    sum_all_in_class: float = 0.0
-    sum_unk_in_class: float = 0.0
-    sum_all_out_of_class: float = 0.0
-    sum_unk_out_of_class: float = 0.0
-    tag_in_class: Set[BinKey] = field(default_factory=set)
-    tag_out_of_class: Set[BinKey] = field(default_factory=set)
-    d_in_class: Set[BinKey] = field(default_factory=set)
-    d_out_of_class: Set[BinKey] = field(default_factory=set)
-    raw_score: float = 0.0
-    noid_score: float = 0.0
+_NUMBA = KERNEL_BACKEND == "numba"
 
-
-@dataclass
-class TrackletState:
-    obs_pair: Tuple[Observation, Observation]
-    obs_err: Tuple[float, float]           # radians
-    no_obs_err: bool
-    rand: Lcg
-    vmag: float
-    sun_observer: Tuple[Vec3, Vec3]
-    dt: float
-    invdt: float
-    invdtsq: float
-    soe: float
-    coe: float
-    is_ades: bool
-    no_threshold: bool
-    class_indices: Sequence[int]           # global class ids being computed
-    model: Model
-
-    per_class: List[PerClass] = field(default_factory=list)
-    observer_object_unit: List[Optional[Vec3]] = field(default_factory=lambda: [None, None])
-
-    # distance-dependent scratch, rewritten by setup_distance_dependent_vectors
-    sun_object0: Vec3 = (0.0, 0.0, 0.0)
-    sun_object0_mag: float = 0.0
-    sun_object0_magsq: float = 0.0
-    observer_object0: Vec3 = (0.0, 0.0, 0.0)
-    observer_object0_mag: float = 0.0
-    observer1_object0: Vec3 = (0.0, 0.0, 0.0)
-    observer1_object0_mag: float = 0.0
-    observer1_object0_magsq: float = 0.0
-    tz: float = 0.0
-    hmag: float = 0.0
-    hmag_bin: int = 0
-
-    d_any_tag: bool = False
-    d_tag: Set[BinKey] = field(default_factory=set)
-
-    def __post_init__(self) -> None:
-        if not self.per_class:
-            self.per_class = [PerClass() for _ in self.class_indices]
-        self._class_tests = [CLASS_TESTS[c] for c in self.class_indices]
+# Partition tables: NumPy arrays for the compiled kernel, plain tuples for
+# the interpreted one (tuple indexing is much cheaper than NumPy scalar
+# indexing, and these are read inside the innermost bin-lookup loops).
+if _NUMBA:
+    _QPART = np.asarray(QPART, dtype=np.float64)
+    _EPART = np.asarray(EPART, dtype=np.float64)
+    _IPART = np.asarray(IPART, dtype=np.float64)
+    _HPART = np.asarray(HPART, dtype=np.float64)
+else:
+    _QPART, _EPART, _IPART, _HPART = QPART, EPART, IPART, HPART
 
 
-def clear_d_tags(state: TrackletState) -> None:
-    state.d_tag.clear()
-    for cl in state.per_class:
-        cl.d_in_class.clear()
-        cl.d_out_of_class.clear()
+class _Buffers:
+    """Scratch buffers for one :func:`score_tracklet` call.
 
+    Allocated per call rather than shared, so the kernel is re-entrant
+    and safe to run from several threads at once (which is the point of
+    compiling it ``nogil``).
+    """
 
-def _update_rms_values(rms_ra: float, rms_dec: float, error_from_config: float,
-                        no_threshold: bool) -> Tuple[float, float]:
-    """Port of updateRMSValues (d2math.c). ``error_from_config`` here is
-    always a local, per-call value (radians); mutating its C-side
-    "effective" fallback never escapes this function."""
-    efc = error_from_config if error_from_config else 1.0
-    if not rms_ra and not rms_dec:
-        return efc, efc
-    if not rms_ra:
-        rms_ra = rms_dec
-    if not rms_dec:
-        rms_dec = rms_ra
-    if no_threshold:
-        if efc > rms_ra:
-            rms_ra = efc
-        if efc > rms_dec:
-            rms_dec = efc
-        return rms_ra, rms_dec
-    min_t, max_t = 0.7 * efc, 5.0 * efc
-    if rms_ra < min_t:
-        rms_ra = min_t
-    if rms_dec < min_t:
-        rms_dec = min_t
-    if rms_ra > max_t:
-        rms_ra = max_t
-    if rms_dec > max_t:
-        rms_dec = max_t
-    if efc > rms_ra:
-        rms_ra = efc
-    if efc > rms_dec:
-        rms_dec = efc
-    return rms_ra, rms_dec
+    __slots__ = ("d_in", "d_out", "g_in", "g_out", "d_keys",
+                 "st_a1", "st_a2", "st_age", "dst_lo", "dst_hi", "dst_age",
+                 "sum_all_in", "sum_unk_in", "sum_all_out", "sum_unk_out",
+                 "pair_ra", "pair_dec", "pair_rms_ra", "pair_rms_dec",
+                 "obs_err", "sun_obs")
 
-
-def offset_motion_vector(state: TrackletState, rx: int, dx: int) -> None:
-    for i in (0, 1):
-        obs = state.obs_pair[i]
-        error_from_config = state.obs_err[i]
-        if state.is_ades:
-            rms_ra, rms_dec = _update_rms_values(
-                obs.rms_ra, obs.rms_dec, error_from_config, state.no_threshold)
-            dec = obs.dec + dx * rms_dec * 0.5
-            cosdec = cos(dec)
-            ra = obs.ra + rx * rms_ra * 0.5 * cosdec
+    def __init__(self) -> None:
+        if _NUMBA:
+            zi = lambda n: np.zeros(n, dtype=np.int64)      # noqa: E731
+            ei = lambda n: np.empty(n, dtype=np.int64)      # noqa: E731
+            ef = lambda n: np.empty(n, dtype=np.float64)    # noqa: E731
+            zf = lambda n: np.zeros(n, dtype=np.float64)    # noqa: E731
         else:
-            dec = obs.dec + dx * error_from_config * 0.5
-            cosdec = cos(dec)
-            ra = obs.ra + rx * error_from_config * 0.5 * cosdec
-        v = (cos(ra) * cosdec, sin(ra) * cosdec, sin(dec))
-        state.observer_object_unit[i] = ec_rotate(v, state.soe, state.coe)
-        rx, dx = -rx, -dx
+            zi = lambda n: [0] * n                          # noqa: E731
+            ei = lambda n: [0] * n                          # noqa: E731
+            ef = lambda n: [0.0] * n                        # noqa: E731
+            zf = lambda n: [0.0] * n                        # noqa: E731
+
+        self.d_in = zi(N_BINS)
+        self.d_out = zi(N_BINS)
+        self.g_in = zi(N_BINS)
+        self.g_out = zi(N_BINS)
+        self.d_keys = ei(N_BINS)
+        self.st_a1 = ef(_ANGLE_STACK)
+        self.st_a2 = ef(_ANGLE_STACK)
+        self.st_age = ei(_ANGLE_STACK)
+        self.dst_lo = ef(_DISTANCE_STACK)
+        self.dst_hi = ef(_DISTANCE_STACK)
+        self.dst_age = ei(_DISTANCE_STACK)
+        self.sum_all_in = zf(15)
+        self.sum_unk_in = zf(15)
+        self.sum_all_out = zf(15)
+        self.sum_unk_out = zf(15)
+        self.pair_ra = ef(2)
+        self.pair_dec = ef(2)
+        self.pair_rms_ra = ef(2)
+        self.pair_rms_dec = ef(2)
+        self.obs_err = ef(2)
+        self.sun_obs = ef(6)
 
 
-# Exponents in the H-magnitude phase-integral approximation (setupDistance-
-# DependentVectors in d2math.c). The C code approximates x**0.63/x**1.22 with
-# a 1024-point interpolated lookup table purely for speed; Python isn't
-# calling this tens of millions of times in a tight loop, so we just use
-# the exact power -- strictly more accurate, and the table's interpolation
-# error is well under the 1% score tolerance this port targets anyway.
-def setup_distance_dependent_vectors(state: TrackletState, d: float) -> None:
-    unit0 = state.observer_object_unit[0]
-    state.observer_object0_mag = d
-    state.observer_object0 = (unit0[0] * d, unit0[1] * d, unit0[2] * d)
+class _FlatModel:
+    """Flat (1-D per bin) views of a :class:`~pydigest2.model.Model`.
 
-    so = state.sun_observer[0]
-    oo0 = state.observer_object0
-    state.sun_object0 = (so[0] + oo0[0], so[1] + oo0[1], so[2] + oo0[2])
-    state.sun_object0_magsq = dot3(state.sun_object0, state.sun_object0)
-    state.sun_object0_mag = sqrt(state.sun_object0_magsq)
+    Reshaping is a view, not a copy, so this is free; it is cached on the
+    Model instance so repeated tracklets don't redo it.
+    """
 
-    so1 = state.sun_observer[1]
-    sun0 = state.sun_object0
-    state.observer1_object0 = (sun0[0] - so1[0], sun0[1] - so1[1], sun0[2] - so1[2])
-    state.observer1_object0_magsq = dot3(state.observer1_object0, state.observer1_object0)
-    state.observer1_object0_mag = sqrt(state.observer1_object0_magsq)
+    __slots__ = ("all_ss", "unk_ss", "all_class", "unk_class")
 
-    rdelta = state.observer_object0_mag * state.sun_object0_mag
-    cospsi = dot3(state.observer_object0, state.sun_object0) / rdelta
-
-    if cospsi > -0.9999:
-        tanhalf = sqrt(1.0 - cospsi * cospsi) / (1.0 + cospsi)
-        phi1 = exp(-3.33 * tanhalf ** 0.63)
-        phi2 = exp(-1.87 * tanhalf ** 1.22)
-        state.hmag = state.vmag - 5.0 * log10(rdelta) + 2.5 * log10(0.85 * phi1 + 0.15 * phi2)
-    else:
-        state.hmag = 30.0  # pointed straight at the sun; give it a valid but meaningless H
-
-    state.hmag_bin = h_to_bin(state.hmag)
+    def __init__(self, model: Model) -> None:
+        self.all_ss = np.ascontiguousarray(model.all_ss.reshape(-1))
+        self.unk_ss = np.ascontiguousarray(model.unk_ss.reshape(-1))
+        self.all_class = np.ascontiguousarray(model.all_class.reshape(-1, N_BINS))
+        self.unk_class = np.ascontiguousarray(model.unk_class.reshape(-1, N_BINS))
 
 
-def tag_angle(state: TrackletState, an: float) -> bool:
-    d2 = state.observer1_object0_mag * sin(an) / sin(pi - an - state.tz)
-
-    unit1 = state.observer_object_unit[1]
-    o1o0 = state.observer1_object0
-    scale = state.invdt * INV_K
-    v = (
-        (d2 * unit1[0] - o1o0[0]) * scale,
-        (d2 * unit1[1] - o1o0[1]) * scale,
-        (d2 * unit1[2] - o1o0[2]) * scale,
-    )
-
-    hv = cross3(state.sun_object0, v)
-    hsq = dot3(hv, hv)
-    hm = sqrt(hsq)
-
-    vsq = dot3(v, v)
-    temp = 2.0 - state.sun_object0_mag * vsq
-    if state.sun_object0_mag > temp * 100.0:
-        return False
-
-    orbit_a = state.sun_object0_mag / temp
-    inva = temp / state.sun_object0_mag
-    orbit_e = sqrt(1.0 - hsq * inva)
-    if orbit_e > 0.99:
-        return False
-
-    izero = hv[2] >= hm
-    orbit_i = 0.0 if izero else degrees(acos(hv[2] / hm))
-
-    q = orbit_a * (1.0 - orbit_e)
-    bin3 = qei_to_bin(q, orbit_e, orbit_i)
-    if bin3 is None:
-        return False
-    key = (bin3[0], bin3[1], bin3[2], state.hmag_bin)
-
-    new_tag = False
-    hmag = state.hmag
-    for cl, test in zip(state.per_class, state._class_tests):
-        if test(q, orbit_e, orbit_i, hmag):
-            if key not in cl.d_in_class:
-                cl.d_in_class.add(key)
-                new_tag = True
-        else:
-            if key not in cl.d_out_of_class:
-                cl.d_out_of_class.add(key)
-                new_tag = True
-
-    if new_tag:
-        state.d_any_tag = True
-        state.d_tag.add(key)
-    return new_tag
+_flat_cache: dict = {}
 
 
-def a_range(state: TrackletState, ang1: float, ang2: float, age: int) -> None:
-    d3 = (ang2 - ang1) / 3.0
-    mid = ang1 + d3 + d3 * state.rand.next()
-    if tag_angle(state, mid) or d3 > MIN_ANGLE_STEP:
-        a_range(state, ang1, mid, 0)
-        a_range(state, mid, ang2, 0)
-        return
-    if age < AGE_LIMIT:
-        a_range(state, ang1, mid, age + 1)
-        a_range(state, mid, ang2, age + 1)
-
-
-def solve_angle_range(state: TrackletState) -> Optional[Tuple[float, float]]:
-    th = dot3(state.observer1_object0, state.observer_object_unit[1]) / state.observer1_object0_mag
-    state.tz = acos(th)
-
-    aa = state.invdtsq
-    bb = (-2.0 * state.observer1_object0_mag * th) * aa
-    cc = state.observer1_object0_magsq * aa - 2.0 * U / state.sun_object0_mag
-    dsc = bb * bb - 4 * aa * cc
-    if not (dsc > 0.0):
-        return None
-
-    sd = sqrt(dsc)
-    sd1 = -sd
-    inv2aa = 0.5 / aa
-    ang1 = ang2 = None
-    while True:
-        d2 = (-bb + sd1) * inv2aa
-        d2s = d2 * d2
-        nns = d2s + state.observer1_object0_magsq - 2.0 * d2 * state.observer1_object0_mag * th
-        nn = sqrt(nns)
-        ca = (nns + state.observer1_object0_magsq - d2s) / (2.0 * nn * state.observer1_object0_mag)
-        sa = d2 * sin(state.tz) / nn
-        ang2 = 2.0 * atan2(sa, 1.0 + ca)
-        if sd1 == sd:
-            break
-        ang1 = ang2
-        sd1 = sd
-    return ang1, ang2
-
-
-def search_angles(state: TrackletState) -> bool:
-    r = solve_angle_range(state)
-    if r is None:
-        return False
-    a_range(state, r[0], r[1], 0)
-
-    if not state.d_any_tag:
-        return False
-
-    new_tag = False
-    model = state.model
-    for key in state.d_tag:
-        iq, ie, ii, ih = key
-        for cl, cls_id in zip(state.per_class, state.class_indices):
-            if key in cl.d_in_class and key not in cl.tag_in_class:
-                new_tag = True
-                cl.tag_in_class.add(key)
-                cl.sum_all_in_class += model.all_class[cls_id, iq, ie, ii, ih]
-                cl.sum_unk_in_class += model.unk_class[cls_id, iq, ie, ii, ih]
-            if key in cl.d_out_of_class and key not in cl.tag_out_of_class:
-                new_tag = True
-                cl.tag_out_of_class.add(key)
-                all_ss = model.all_ss[iq, ie, ii, ih]
-                unk_ss = model.unk_ss[iq, ie, ii, ih]
-                cl.sum_all_out_of_class += all_ss - model.all_class[cls_id, iq, ie, ii, ih]
-                cl.sum_unk_out_of_class += unk_ss - model.unk_class[cls_id, iq, ie, ii, ih]
-    return new_tag
-
-
-def search_distance(state: TrackletState, d: float) -> bool:
-    clear_d_tags(state)
-    state.d_any_tag = False
-    new_tag = False
-    for ri in (-1, 0, 1):
-        for di in (-1, 0, 1):
-            offset_motion_vector(state, ri, di)
-            setup_distance_dependent_vectors(state, d)
-            if search_angles(state):
-                new_tag = True
-            if state.no_obs_err:
-                return new_tag
-    return new_tag
-
-
-def d_range(state: TrackletState, d1: float, d2: float, age: int) -> None:
-    dmid = (d1 + d2) * 0.5
-    if search_distance(state, dmid) or d2 - d1 > MIN_DISTANCE_STEP:
-        d_range(state, d1, dmid, 0)
-        d_range(state, dmid, d2, 0)
-        return
-    if age < AGE_LIMIT:
-        d_range(state, d1, dmid, age + 1)
-        d_range(state, dmid, d2, age + 1)
+def _flat_model(model: Model) -> _FlatModel:
+    flat = _flat_cache.get(id(model))
+    if flat is None:
+        flat = _FlatModel(model)
+        # keyed by identity, with a reference to the model kept alive by the
+        # caller; bounded because a process holds one or two models at most
+        _flat_cache[id(model)] = flat
+    return flat
 
 
 def gc_rms_prime_ades(olist: Sequence[Observation], obs_err0_rad: float,
@@ -396,10 +202,7 @@ def score_tracklet(olist: Sequence[Observation], *, vmag: float, is_ades: bool,
                     class_indices: Sequence[int], model: Model, site_table: SiteTable,
                     default_obserr_rad: float, no_threshold: bool,
                     repeatable: bool, seed: int = 3) -> ScoreResult:
-    """Score one tracklet. Direct port of d2math.c's ``score()`` driver,
-    combining motion-vector synthesis, the adaptive search, and the
-    final raw/no-ID percentage computation.
-    """
+    """Score one tracklet. Direct port of d2math.c's ``score()`` driver."""
     mv = two_obs(olist, site_table)
     obs_pair = mv.obs_pair
 
@@ -407,52 +210,64 @@ def score_tracklet(olist: Sequence[Observation], *, vmag: float, is_ades: bool,
     invdt = 1.0 / dt
     invdtsq = invdt * invdt
 
-    obs_err = [0.0, 0.0]
-    sun_observer: List[Vec3] = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)]
+    buf = _Buffers()
+
+    # solve the sun->observer vectors at the two observation times
     soe = coe = 0.0
     for i in (0, 1):
         obs = obs_pair[i]
         site = site_table[parse_cod3(obs.obscode)]
-        obs_err[i] = clip_err(mv.obs_err_rms[i], site, default_obserr_rad)
-        sun_earth, soe, coe = se2000(obs.mjd)  # tk->soe/coe end up holding pair[1]'s values
+        buf.obs_err[i] = clip_err(mv.obs_err_rms[i], site, default_obserr_rad)
+        # tk->soe/coe end up holding pair[1]'s values, as in the C source
+        sun_earth, soe, coe = se2000(obs.mjd)
         if obs.spacebased:
             v = obs.earth_observer
         else:
             th = lst(obs.mjd, site.longitude)
             v = (site.rho_cos_phi * cos(th), site.rho_cos_phi * sin(th), site.rho_sin_phi)
-        v = sub3(v, sun_earth)
-        sun_observer[i] = ec_rotate(v, soe, coe)
+        v = ec_rotate(sub3(v, sun_earth), soe, coe)
+        buf.sun_obs[i * 3] = v[0]
+        buf.sun_obs[i * 3 + 1] = v[1]
+        buf.sun_obs[i * 3 + 2] = v[2]
+        buf.pair_ra[i] = obs.ra
+        buf.pair_dec[i] = obs.dec
+        buf.pair_rms_ra[i] = obs.rms_ra
+        buf.pair_rms_dec[i] = obs.rms_dec
 
-    no_obs_err = obs_err[0] == 0.0 and obs_err[1] == 0.0
+    no_obs_err = buf.obs_err[0] == 0.0 and buf.obs_err[1] == 0.0
 
-    state = TrackletState(
-        obs_pair=obs_pair, obs_err=tuple(obs_err), no_obs_err=no_obs_err,
-        rand=Lcg(seed if repeatable else _random_odd_seed()),
-        vmag=vmag, sun_observer=tuple(sun_observer), dt=dt, invdt=invdt, invdtsq=invdtsq,
-        soe=soe, coe=coe, is_ades=is_ades, no_threshold=no_threshold,
-        class_indices=list(class_indices), model=model,
+    class_bits = 0
+    for c in class_indices:
+        class_bits |= 1 << c
+
+    flat = _flat_model(model)
+
+    _search_all(
+        buf.pair_ra, buf.pair_dec, buf.pair_rms_ra, buf.pair_rms_dec, buf.obs_err,
+        soe, coe, is_ades, no_threshold, no_obs_err,
+        buf.sun_obs, invdt, invdtsq, vmag, class_bits,
+        flat.all_ss, flat.unk_ss, flat.all_class, flat.unk_class,
+        _QPART, _EPART, _IPART, _HPART,
+        (seed if repeatable else _random_odd_seed()),
+        buf.d_in, buf.d_out, buf.g_in, buf.g_out, buf.d_keys,
+        buf.st_a1, buf.st_a2, buf.st_age, buf.dst_lo, buf.dst_hi, buf.dst_age,
+        buf.sum_all_in, buf.sum_unk_in, buf.sum_all_out, buf.sum_unk_out,
     )
-
-    search_distance(state, MIN_DISTANCE)
-    search_distance(state, MAX_DISTANCE)
-    d_range(state, MIN_DISTANCE, MAX_DISTANCE, 0)
 
     rms_prime = 0.0
     if is_ades:
-        rms_prime = gc_rms_prime_ades(olist, obs_err[0], no_threshold)
+        rms_prime = gc_rms_prime_ades(olist, buf.obs_err[0], no_threshold)
         if rms_prime == 0.0:
-            rms_prime = gc_rms_prime_mpc(obs_err[0])
+            rms_prime = gc_rms_prime_mpc(buf.obs_err[0])
 
     raw_scores, noid_scores = {}, {}
-    for cls_id, cl in zip(state.class_indices, state.per_class):
-        denom_all = cl.sum_all_in_class + cl.sum_all_out_of_class
-        raw = (100.0 * cl.sum_all_in_class / denom_all if denom_all > 0.0
+    for cls_id in class_indices:
+        denom_all = buf.sum_all_in[cls_id] + buf.sum_all_out[cls_id]
+        raw = (100.0 * buf.sum_all_in[cls_id] / denom_all if denom_all > 0.0
                else (100.0 if cls_id < 2 else 0.0))
-        denom_unk = cl.sum_unk_in_class + cl.sum_unk_out_of_class
-        noid = (100.0 * cl.sum_unk_in_class / denom_unk if denom_unk > 0.0
+        denom_unk = buf.sum_unk_in[cls_id] + buf.sum_unk_out[cls_id]
+        noid = (100.0 * buf.sum_unk_in[cls_id] / denom_unk if denom_unk > 0.0
                 else (100.0 if cls_id < 2 else 0.0))
-        # model lookups are numpy float64 scalars; the public result is
-        # plain Python floats so callers never have to think about it.
         raw_scores[cls_id] = float(raw)
         noid_scores[cls_id] = float(noid)
 
@@ -462,4 +277,4 @@ def score_tracklet(olist: Sequence[Observation], *, vmag: float, is_ades: bool,
 
 def _random_odd_seed() -> int:
     import os
-    return (int.from_bytes(os.urandom(7), "little") | 1)
+    return int.from_bytes(os.urandom(7), "little") | 1

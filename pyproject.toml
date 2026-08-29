@@ -21,7 +21,12 @@ classifiers = [
 dependencies = ["numpy"]
 
 [project.optional-dependencies]
+# Optional JIT accelerator: ~30x faster scoring, and lets batches
+# parallelize with threads instead of processes. Never required --
+# without it the same kernel runs interpreted. See README.
+fast = ["numba"]
 test = ["pytest", "numpy"]
+all = ["numba", "pytest"]
 
 [project.scripts]
 pydigest2 = "pydigest2.cli:main"

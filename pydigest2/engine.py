@@ -4,7 +4,7 @@ scores tracklets against them, optionally fanning out across processes.
 from __future__ import annotations
 
 import os
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -14,7 +14,7 @@ from .model import Model, load_model
 from .obscodes import SiteTable
 from .observations import Observation
 from .paths import find_model_path, find_obscodes_path
-from .ranging import ScoreResult, score_tracklet
+from .ranging import KERNEL_BACKEND, ScoreResult, score_tracklet
 
 
 def compute_vmag(olist: Sequence[Observation]) -> float:
@@ -78,75 +78,82 @@ class Digest2Engine:
         )
 
 
-# --- process-pool fan-out for scoring many tracklets -----------------------
+# --- parallel fan-out for scoring many tracklets ---------------------------
 #
-# Correctness note: a worker MUST score against the exact same Config and
-# SiteTable as the calling engine -- including any obserr overrides or
-# repeatable/class-set choices made programmatically after load(), which
-# a config *file* path can't reconstruct. So the initializer is handed the
-# already-built Config/SiteTable objects (small, cheap to pickle) directly,
-# rather than a path to re-derive them from. On fork-based platforms
-# (Linux/macOS) workers usually inherit a fully-populated engine via
-# copy-on-write before the pool even starts, in which case the initializer
-# is a no-op; the pickled fallback below only matters on spawn (Windows) or
-# if the engine wasn't built until after the pool started.
+# Tracklets are fully independent of one another (each has its own RNG
+# stream and its own per-class tag sets), so the batch is embarrassingly
+# parallel. That is this port's throughput lever, since an individual
+# tracklet's adaptive search is inherently sequential -- see
+# :mod:`pydigest2.ranging`.
+#
+# Which pool to use depends on the kernel backend:
+#
+# * **numba present** -> threads. The compiled kernel is built ``nogil``,
+#   so it genuinely runs in parallel, and threads share the loaded model
+#   outright: no pickling, no per-worker reload, no memory multiplication.
+# * **pure Python** -> processes, because the interpreted kernel holds
+#   the GIL and threads would serialize.
+#
+# Correctness note for the process path: a worker MUST score against the
+# exact same Config and SiteTable as the calling engine -- including any
+# obserr overrides or repeatable/class-set choices made programmatically
+# after load(), which a config *file* path can't reconstruct. So the
+# initializer is handed the already-built Config/SiteTable objects (small,
+# cheap to pickle) directly, rather than a path to re-derive them from.
 
 _worker_engine: Optional[Digest2Engine] = None
 
 
-def _init_worker(model_path: str, obscodes_path: str, site_table: SiteTable, config: Config) -> None:
+def _init_worker(model_path: Optional[str], site_table: SiteTable, config: Config) -> None:
     global _worker_engine
     if _worker_engine is not None:
         return  # already inherited a live engine via fork/copy-on-write
-    model = load_model(model_path)
-    _worker_engine = Digest2Engine(model, site_table, config)
+    _worker_engine = Digest2Engine(load_model(model_path), site_table, config)
 
 
 def _score_one(args) -> Tuple[str, object]:
     desig, olist, is_ades = args
     assert _worker_engine is not None
-    problem = validate_tracklet(olist)
-    if problem is not None:
-        return desig, problem
-    try:
-        return desig, _worker_engine.score(olist, is_ades=is_ades)
-    except ArithmeticError as e:
-        return desig, TrackletProblem(str(e))
+    return _score_sequential(desig, olist, is_ades, _worker_engine)
 
 
 def score_many(
     tracklets: Sequence[Tuple[str, Sequence[Observation], bool]],
     engine: Digest2Engine,
-    model_path: str,
-    obscodes_path: str,
+    model_path: Optional[str] = None,
+    obscodes_path: Optional[str] = None,
     n_jobs: Optional[int] = None,
 ) -> List[Tuple[str, object]]:
-    """Score many (designation, observations, is_ades) tracklets, using a
-    process pool when there's enough work to be worth it.
+    """Score many (designation, observations, is_ades) tracklets in parallel.
 
-    Every tracklet is fully independent (its own RNG stream, its own
-    per-class tag sets), which is what makes this embarrassingly
-    parallel -- this is the throughput lever for this port, since each
-    individual tracklet's adaptive search is inherently sequential (see
-    :mod:`pydigest2.ranging`). Workers score against ``engine``'s exact
-    ``config``/``site_table`` (see the correctness note above); on
-    Linux/macOS the already-loaded model is inherited via copy-on-write
-    too, so there's no per-worker reload cost in the common case.
+    Workers always score against ``engine``'s exact ``config`` and
+    ``site_table``. ``model_path`` is only consulted by process workers
+    that could not inherit the loaded model (i.e. spawn-based platforms);
+    it is unused on the thread path and on fork.
     """
     n_jobs = n_jobs or os.cpu_count() or 1
     n_jobs = max(1, min(n_jobs, len(tracklets) or 1))
 
     if n_jobs <= 1 or len(tracklets) < 8:
-        return [_score_sequential(desig, olist, is_ades, engine) for desig, olist, is_ades in tracklets]
+        return [_score_sequential(desig, olist, is_ades, engine)
+                for desig, olist, is_ades in tracklets]
+
+    chunksize = max(1, len(tracklets) // (n_jobs * 4))
+
+    if KERNEL_BACKEND == "numba":
+        with ThreadPoolExecutor(max_workers=n_jobs) as pool:
+            return list(pool.map(
+                lambda t: _score_sequential(t[0], t[1], t[2], engine),
+                tracklets, chunksize=chunksize))
 
     global _worker_engine
-    _worker_engine = engine  # visible to forked children immediately; see _init_worker
+    _worker_engine = engine  # visible to forked children immediately
 
     with ProcessPoolExecutor(
         max_workers=n_jobs, initializer=_init_worker,
-        initargs=(model_path, obscodes_path, engine.site_table, engine.config),
+        initargs=(model_path, engine.site_table, engine.config),
     ) as pool:
-        return list(pool.map(_score_one, tracklets, chunksize=max(1, len(tracklets) // (n_jobs * 4) or 1)))
+        return list(pool.map(_score_one, tracklets, chunksize=chunksize))
 
 
 def _score_sequential(desig, olist, is_ades, engine: Digest2Engine):

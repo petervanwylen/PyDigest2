@@ -7,8 +7,8 @@ Trojan, Jupiter-family-comet, etc.) from as few as two observations of a trackle
 This is an independent line-by-line reimplementation of the algorithm in
 [Bill Gray / MPC's C `digest2`](https://github.com/Smithsonian/mpc-public/tree/main/digest2)
 (current as of the source snapshot this port was validated against, August 2026)
-— no C code, no C extension, numpy for the population-model data and
-multiprocessing for throughput. It is a different thing from the Smithsonian
+— no C code and no C extension: numpy holds the population model, and an
+optional JIT plus cross-tracklet parallelism carry the throughput. It is a different thing from the Smithsonian
 `digest2` PyPI package, which wraps the *same C engine* as a compiled extension
 (and is therefore bit-identical to the CLI by construction); this project
 reimplements the numerics themselves in Python, which is a much better fit for
@@ -19,10 +19,12 @@ for exactly what that costs.
 ## Install
 
 ```bash
-pip install -e .
+pip install -e .          # pure Python; numpy only
+pip install -e ".[fast]"  # + numba JIT: ~30x faster, recommended
 ```
 
-Requires only `numpy`. The population model (`digest2.model.csv`) and
+Requires only `numpy`; `numba` is an optional accelerator (see
+[Performance](#performance)). The population model (`digest2.model.csv`) and
 observatory-code table (`digest2.obscodes`) ship bundled under
 `pydigest2/data/`, so it works out of the box with no extra downloads.
 
@@ -60,7 +62,7 @@ for desig, olist in parse_mpc80_file("sample.obs").items():
 ```
 
 For batch throughput, `pydigest2.engine.score_many()` fans tracklets out
-across a process pool (see **Performance design** below).
+across worker threads or processes (see [Performance](#performance)).
 
 ## Validated accuracy
 
@@ -77,13 +79,11 @@ harness linked directly against `d2lib.c`), fed byte-identical inputs:
   resulting orbit elements (q, e, i) to 10+ significant digits at the first
   several recursion nodes checked by hand, and the *linear congruential
   generator* driving the jitter is bit-identical.
-- **End-to-end scores**, on a sample of 250 real NEOCP tracklets (repeatable
-  mode, all 15 classes): **94.8% of tracklets match the C reference exactly
-  or to floating-point noise**, and **99.4% of all individual raw/no-ID score
-  values are within 1 point (on the 0–100 scale) of the reference.** The
-  residual ~5% of tracklets showing a few-point divergence are consistently
-  the shortest/sparsest arcs (2–4 observations) — see the next paragraph for
-  why.
+- **End-to-end scores**, over **5,339 real NEOCP tracklets** run through
+  both CLIs with identical config (repeatable mode): **99.46% produce
+  byte-identical printed scores**, 99.87% agree on NEO to within 1 point
+  (on the 0–100 scale), 100% agree on MB1 to within 1 point, and only
+  **7 tracklets (0.13%) differ by more than 1 point** on any score.
 
 **Why isn't it 100%?** This is a chaotic, recursive, floating-point algorithm:
 which orbit bins get tagged depends on hard threshold comparisons (bin edges,
@@ -109,28 +109,58 @@ Re-running this validation (against your own C build) is straightforward and
 documented inline in `tests/test_integration.py` and `tests/test_cli.py`,
 which encode the exact reference values this was checked against.
 
-## Performance design
+## Performance
 
-The search for a single tracklet is **not** a good fit for NumPy vectorization:
-it's a data- and RNG-dependent recursive tree walk (see the module docstring
-in `pydigest2/ranging.py`), so the per-node 3-vector math stays plain Python
-floats/tuples — for objects this small, NumPy's per-call array overhead
-comfortably loses to the interpreter's own float arithmetic. Two things *do*
-get NumPy/parallelism:
+Speed is roughly at parity with the compiled C reference. Measured on the
+same machine (4 cores), scoring the same 5,339 real NEOCP tracklets
+through each program's CLI:
 
-1. **The population model** (four arrays, up to `(15, 29, 8, 11, 18)`
-   float64) is NumPy end-to-end, with a fast-loading `.npz` cache generated
-   next to the CSV on first use (mirrors the C tool's own CSV→binary
-   caching, just in this package's own format).
-2. **Tracklets are independent of each other** — no shared state, separate
-   RNG streams — so `pydigest2.engine.score_many()` fans a batch out across a
-   `ProcessPoolExecutor` (real parallelism, unlike threads, since the search
-   is pure-Python CPU work under the GIL). On fork-based platforms
-   (Linux/macOS) workers inherit the already-loaded model via copy-on-write,
-   so there's no per-worker reload cost. In informal testing, 250 real NEOCP
-   tracklets scored in ~51s on 4 cores (~5 tracklets/s), vs. the C CLI's
-   ~22ms/tracklet single-threaded — Python is slower per tracklet, as
-   expected, but the parallel batch API keeps large files practical.
+| | 1 core | all 4 cores |
+|---|---|---|
+| C `digest2` | 10.3 ms/tracklet | 2.61 ms/tracklet |
+| **pydigest2** (with `[fast]`) | 10.9 ms/tracklet | 2.96 ms/tracklet |
+| pydigest2 (pure Python) | ~600 ms/tracklet | ~150 ms/tracklet |
+
+Getting there needed three things, in order of how much they mattered:
+
+1. **An optional JIT.** `pip install pydigest2[fast]` pulls in numba,
+   which compiles the search kernel and makes it ~30x faster. It is
+   never required: without it, the *same function* runs interpreted, and
+   everything still works — just slowly. Both paths are built from one
+   source (`pydigest2/_search.py`) precisely so they cannot drift, and
+   `tests/test_kernel.py` asserts they produce bit-identical scores.
+2. **Bitmask bin tagging.** The reference implementation tracks, per
+   orbit class, two sets of tagged (q,e,i,H) bins, and its tag-merge
+   step loops over every class for every tagged bin. Representing "which
+   classes is this bin tagged for" as one integer bitmask collapses that
+   from O(bins x classes) to O(bins), and reduces the innermost
+   bookkeeping to a couple of integer ops. This is a genuine algorithmic
+   improvement over the C original, and it is why the Python version can
+   land this close despite the language gap.
+3. **Fusing the inner loop.** The angle search runs ~350k–500k times per
+   tracklet; in CPython the per-call and attribute-lookup overhead of a
+   nicely decomposed version was ~60% of total runtime. The kernel is
+   therefore one long function with the recursion flattened into an
+   explicit stack. That is a real readability cost, taken deliberately in
+   exactly one place, and the readable one-concept-per-function form of
+   every piece still exists and is still what the unit tests check
+   (`pydigest2/classes.py`, `pydigest2/binning.py`).
+
+What is *not* used is NumPy vectorization of the search itself. That
+looks tempting and doesn't work: the search is a data-dependent recursive
+tree walk whose branching depends on whether each trial orbit lands in a
+previously-untagged bin, and whose midpoints are jittered by an LCG that
+must be consumed in exactly that traversal order to reproduce the
+reference program's results. There is no fixed set of steps to batch
+across. NumPy earns its place holding the population model; the
+parallelism that exists is *across* tracklets, which are fully
+independent.
+
+`--cpu`/`-u` selects worker threads when the compiled kernel is present
+(it releases the GIL, so threads give real parallelism and share the
+loaded model outright) and worker processes otherwise. As in the
+reference program the default is every core, and output order and scores
+are identical regardless of worker count.
 
 ## Deliberate differences from the C CLI
 
@@ -145,9 +175,9 @@ get NumPy/parallelism:
 - `.psv` (ADES pipe-separated-value) input is supported as a bonus; there is
   no C reference for this format (the compiled reference CLI reads MPC80 and
   ADES XML only).
-- `--cpu`/`-u` selects worker *processes*, not OS threads (Python has no
-  equivalent to lightweight threads sharing one interpreter under the GIL for
-  CPU-bound work).
+- `--cpu`/`-u` selects worker threads (with the compiled kernel, which releases
+  the GIL) or worker processes (without it), rather than the C program's OS
+  threads. Same meaning, same default of "every core".
 - Malformed `digest2.config` lines raise a clear error rather than silently
   misparsing; in particular, CRLF line endings (which the real MPC.config
   distributed alongside the model data actually has, and which the C reader's
@@ -175,9 +205,10 @@ behavior and covered by tests.
 | `observations.py` | MPC80 / ADES XML / ADES PSV parsing |
 | `geometry.py` | Solar ephemeris, great-circle fit/RMS |
 | `tracklet.py` | Motion-vector synthesis (`twoObs`/`oneObs`) |
-| `ranging.py` | The adaptive orbit search itself, and the final score computation |
+| `_search.py` | The search kernel: one function, run interpreted or JIT-compiled |
+| `ranging.py` | Scoring driver: motion vector -> search -> class percentages |
 | `config.py` | `digest2.config` parsing, CLI config state |
-| `engine.py` | High-level scoring engine, incl. process-pool batch scoring |
+| `engine.py` | High-level scoring engine, incl. parallel batch scoring |
 | `intake.py` | Streaming tracklet grouping matching the reference CLI exactly |
 | `output.py` | Score-table formatting |
 | `cli.py` | The `pydigest2` command-line entry point |

@@ -16,9 +16,17 @@ Differences from the reference C program, by design:
   optimization, not an interchange format, in either implementation.
 * A ``.psv`` input file is read as ADES pipe-separated-value (no C
   reference exists for this format; see :mod:`pydigest2.observations`).
-* ``--cpu``/``-u`` selects worker *processes* (Python has no
-  equivalent to lightweight OS threads sharing one interpreter under
-  the GIL); see :mod:`pydigest2.engine`.
+* ``--cpu``/``-u`` selects worker threads when the compiled kernel is
+  available and worker *processes* otherwise (the interpreted kernel
+  holds the GIL, so threads would serialize); see
+  :mod:`pydigest2.engine`. As in the reference program, the default is
+  every available core.
+
+Tracklets are scored in batches rather than one at a time, so a run can
+use several cores without holding a whole input file in memory. Output
+order always matches input order, independent of batch size and worker
+count -- and so do the scores themselves, since each tracklet carries
+its own independent RNG stream.
 """
 from __future__ import annotations
 
@@ -26,18 +34,19 @@ import argparse
 import sys
 import urllib.request
 from pathlib import Path
-from typing import Optional, Sequence, TextIO
+from typing import List, Optional, Sequence, TextIO
 
 from .classes import CLASS_ABBR, CLASS_HEADING
 from .config import Config, ConfigError, apply_config_lines, parse_limit_spec
-from .engine import Digest2Engine, compute_vmag, validate_tracklet
+from .engine import (
+    Digest2Engine, TrackletProblem, score_many, validate_tracklet,
+)
 from .intake import InvalidRun, iter_ades_xml_tracklets, iter_mpc80_tracklets
 from .model import load_model, save_model_cache
 from .obscodes import SiteTable
 from .observations import parse_ades_psv
 from .output import format_header_lines, format_mpc_desig, format_score_line, strtok_first_token
 from .paths import find_model_path, find_obscodes_path
-from .ranging import score_tracklet
 
 OBSCODES_URL = "https://minorplanetcenter.net/iau/lists/ObsCodes.html"
 
@@ -165,65 +174,86 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(line, file=out)
 
     for fn in args.obs_files:
-        _process_file(fn, engine, cfg, out)
+        _process_file(fn, engine, cfg, out, args.cpu)
     return 0
 
 
-def _process_file(fn: str, engine: Digest2Engine, cfg: Config, out: TextIO) -> None:
+# Tracklets are scored in batches so that a run can use several cores
+# (see --cpu) without having to hold a whole input file in memory. Output
+# stays in input order regardless of batch size or worker count.
+_BATCH = 256
+
+
+def _process_file(fn: str, engine: Digest2Engine, cfg: Config, out: TextIO,
+                   n_jobs: Optional[int]) -> None:
     ext = Path(fn).suffix.lower().lstrip(".")
     if fn != "-" and ext == "xml":
-        _process_tracklet_stream(iter_ades_xml_tracklets(fn), is_ades=True, engine=engine, cfg=cfg, out=out)
+        _process_tracklet_stream(iter_ades_xml_tracklets(fn), is_ades=True,
+                                  engine=engine, cfg=cfg, out=out, n_jobs=n_jobs)
     elif fn != "-" and ext == "psv":
-        tracklets = parse_ades_psv(fn)
-        for desig, olist in tracklets.items():
-            _score_and_print(desig, desig, olist, is_ades=True, engine=engine, cfg=cfg, out=out)
+        batch = [(desig, desig, olist) for desig, olist in parse_ades_psv(fn).items()]
+        _flush_batch(batch, is_ades=True, engine=engine, cfg=cfg, out=out, n_jobs=n_jobs)
+    elif fn == "-":
+        _process_mpc80_lines(sys.stdin, engine, cfg, out, n_jobs)
     else:
-        if fn == "-":
-            lines = sys.stdin
-            _process_mpc80_lines(lines, engine, cfg, out)
-        else:
-            try:
-                with open(fn, "r") as f:
-                    _process_mpc80_lines(f, engine, cfg, out)
-            except OSError:
-                print(f"Open {fn} failed.", file=sys.stderr)
+        try:
+            with open(fn, "r") as f:
+                _process_mpc80_lines(f, engine, cfg, out, n_jobs)
+        except OSError:
+            print(f"Open {fn} failed.", file=sys.stderr)
 
 
-def _process_mpc80_lines(lines, engine: Digest2Engine, cfg: Config, out: TextIO) -> None:
-    _process_tracklet_stream(iter_mpc80_tracklets(lines), is_ades=False, engine=engine, cfg=cfg, out=out)
+def _process_mpc80_lines(lines, engine: Digest2Engine, cfg: Config, out: TextIO,
+                          n_jobs: Optional[int]) -> None:
+    _process_tracklet_stream(iter_mpc80_tracklets(lines), is_ades=False,
+                              engine=engine, cfg=cfg, out=out, n_jobs=n_jobs)
 
 
-def _process_tracklet_stream(stream, *, is_ades: bool, engine: Digest2Engine, cfg: Config, out: TextIO) -> None:
+def _process_tracklet_stream(stream, *, is_ades: bool, engine: Digest2Engine,
+                              cfg: Config, out: TextIO, n_jobs: Optional[int]) -> None:
+    batch: List[tuple] = []
     for item in stream:
         if isinstance(item, InvalidRun):
+            # flush first so the message lands in the right place in the output
+            _flush_batch(batch, is_ades=is_ades, engine=engine, cfg=cfg,
+                          out=out, n_jobs=n_jobs)
             print(f"{item.n_lines} lines skipped for .", file=out)
             continue
         display = item.desig if is_ades else format_mpc_desig(item.desig)
         message_desig = item.desig if is_ades else strtok_first_token(item.desig)
-        _score_and_print(display, message_desig, item.observations, is_ades=is_ades,
-                          engine=engine, cfg=cfg, out=out)
+        batch.append((display, message_desig, item.observations))
+        if len(batch) >= _BATCH:
+            _flush_batch(batch, is_ades=is_ades, engine=engine, cfg=cfg,
+                          out=out, n_jobs=n_jobs)
+    _flush_batch(batch, is_ades=is_ades, engine=engine, cfg=cfg, out=out, n_jobs=n_jobs)
 
 
-def _score_and_print(display_desig: str, message_desig: str, olist, *, is_ades: bool,
-                      engine: Digest2Engine, cfg: Config, out: TextIO) -> None:
-    problem = validate_tracklet(olist)
-    if problem is not None:
-        print(f"{message_desig} {problem.reason}", file=out)
+def _flush_batch(batch: List[tuple], *, is_ades: bool, engine: Digest2Engine,
+                  cfg: Config, out: TextIO, n_jobs: Optional[int]) -> None:
+    """Score a batch of tracklets (in parallel when asked for) and print
+    the results in the order they were read."""
+    if not batch:
         return
-    vmag = compute_vmag(olist)
-    try:
-        result = score_tracklet(
-            olist, vmag=vmag, is_ades=is_ades, class_indices=cfg.class_compute,
-            model=engine.model, site_table=engine.site_table,
-            default_obserr_rad=cfg.default_obserr_rad, no_threshold=cfg.no_threshold,
-            repeatable=cfg.repeatable,
-        )
-    except ArithmeticError as e:
-        print(f"{message_desig} {e}", file=out)
-        return
-    line = format_score_line(display_desig, result, cfg)
-    if line is not None:
-        print(line, file=out)
+
+    checked = [(display, message, olist, validate_tracklet(olist))
+               for display, message, olist in batch]
+    todo = [(display, olist, is_ades)
+            for display, _, olist, problem in checked if problem is None]
+    # score_many preserves input order, so results zip back positionally
+    results = iter(score_many(todo, engine, n_jobs=n_jobs) if todo else ())
+
+    for display, message, _olist, problem in checked:
+        if problem is not None:
+            print(f"{message} {problem.reason}", file=out)
+            continue
+        _, result = next(results)
+        if isinstance(result, TrackletProblem):
+            print(f"{message} {result.reason}", file=out)
+            continue
+        line = format_score_line(display, result, cfg)
+        if line is not None:
+            print(line, file=out)
+    batch.clear()
 
 
 def _generate_model_cache(csv_path: str, target_path: str) -> None:

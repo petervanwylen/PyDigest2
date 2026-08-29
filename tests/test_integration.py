@@ -4,7 +4,6 @@ package's C extension, and a standalone C harness linked directly against
 d2lib.c) for identical inputs and config. See the port's validation notes
 for how these were generated -- they are not hand-computed.
 """
-import math
 from pathlib import Path
 
 import pytest
@@ -88,12 +87,13 @@ def test_class_restricted_scoring_matches_c_reference(engine):
     in the sun-observer vector's tiny out-of-plane component), so
     sub-ULP differences that accumulate across ~100k+ recursive calls
     occasionally flip a bin-tagging decision relative to the C build.
-    Across a broader validation sample (250 real NEOCP tracklets) this
-    class of divergence affected ~5% of tracklets, all similarly
-    short-arc, with the rest matching exactly or near-exactly -- see
-    README.md. The loose tolerances here pin down that *this specific,
-    already-diagnosed* divergence doesn't silently grow into something
-    worse, without turning into a flaky exact-match assertion.
+    Across a broad validation sample (5,339 real NEOCP tracklets run
+    through both CLIs) this class of divergence leaves 99.46% of
+    tracklets byte-identical and only 0.13% differing by more than a
+    point -- see README.md. The loose tolerances here pin down that
+    *this specific, already-diagnosed* divergence doesn't silently grow
+    into something worse, without turning into a flaky exact-match
+    assertion.
     """
     tracklets = parse_mpc80_file(str(FIXTURES / "three-hr-tracklets.obs"))
     olist = tracklets["S1795       "]
@@ -105,12 +105,14 @@ def test_class_restricted_scoring_matches_c_reference(engine):
     assert result.raw_scores[7] == pytest.approx(8.66, abs=0.5)
 
 
-def test_score_many_matches_sequential_scoring(engine, tmp_path):
-    """Regression test for a real bug this port's own validation caught:
-    process-pool workers must score against the *caller's* Config/
-    SiteTable (repeatable flag, obserr overrides, ...), not fresh
-    defaults reloaded from a config path. Compares parallel scoring
-    against sequential scoring of the same tracklets."""
+def test_score_many_matches_sequential_scoring(engine):
+    """Parallel scoring must be exactly equal to sequential scoring.
+
+    This covers two real hazards at once: the worker-config bug this
+    port's own validation caught (workers must score against the
+    *caller's* Config/SiteTable -- repeatable flag, obserr overrides --
+    not fresh defaults reloaded from a path), and, on the compiled
+    kernel, thread-safety of the nogil search running concurrently."""
     tracklets_dict = parse_mpc80_file(str(FIXTURES / "three-hr-tracklets.obs"))
     items = [(desig, olist, False) for desig, olist in tracklets_dict.items()]
 
