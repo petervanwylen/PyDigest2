@@ -8,3 +8,8 @@ dist/
 *.npz
 .pytest_cache/
 digest2.obscodes.new
+# Binary model cache written by the reference C digest2 tool/extension
+# (a byproduct of running it against pydigest2/data/ during validation,
+# not something this package generates or needs -- see model.py, which
+# uses .npz caching instead).
+pydigest2/data/digest2.model
