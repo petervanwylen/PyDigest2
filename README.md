@@ -4,8 +4,13 @@ A pure-Python port of **digest2**, the Minor Planet Center's statistical-ranging
 tool for classifying short-arc asteroid astrometry (NEO, Mars-crosser, main-belt,
 Trojan, Jupiter-family-comet, etc.) from as few as two observations of a tracklet.
 
+The algorithm is described in [Keys et al. (2019), *The digest2 NEO
+Classification Code*, PASP 131:064501](https://arxiv.org/abs/1904.09188);
+[`docs/ALGORITHM.md`](docs/ALGORITHM.md) walks through how it works and maps
+each step onto the code here.
+
 This is an independent line-by-line reimplementation of the algorithm in
-[Bill Gray / MPC's C `digest2`](https://github.com/Smithsonian/mpc-public/tree/main/digest2)
+[the MPC's C `digest2`](https://github.com/Smithsonian/mpc-public/tree/main/digest2)
 (current as of the source snapshot this port was validated against, August 2026)
 — no C code and no C extension: numpy holds the population model, and an
 optional JIT plus cross-tracklet parallelism carry the throughput. It is a different thing from the Smithsonian
@@ -97,13 +102,26 @@ cascade into a several-point score difference for a *sparse* tracklet, where
 each bin carries more relative weight. This is not fixable by "trying harder"
 to match the C build line-for-line; it would require literally identical
 instruction-level floating-point behavior, which two independent
-implementations in different languages cannot generally guarantee. It's worth
-noting the reference program itself is non-deterministic by default (it only
-becomes reproducible with the `repeatable` config keyword, reseeding a
-random-per-run generator) — so treating "within about a point, the large
-majority of the time" as the right notion of "identical" is not a compromise
-specific to this port, it's how the algorithm is meant to be read even against
-itself.
+implementations in different languages cannot generally guarantee.
+
+### What "identical" can mean here at all
+
+digest2's search deliberately jitters its sampling, so it does not reproduce
+its own scores exactly. Keys et al. (2019) §4.4.1 measure this over 1000
+tracklets run 100 times each, in the **default random-seed mode the MPC uses
+in production** (chosen deliberately, "to avoid bias"):
+
+- only **82%** of tracklets reproduce the same integer D2 between runs
+- **0.7%** vary by more than 3 points
+- one real NEOCP candidate (`P10Gj15`) scored anywhere from below 60 to 66
+  across 1000 runs — flipping its eligibility around the threshold of 65
+
+Against that baseline, this port differs from the C reference on **0.13%** of
+tracklets by more than 1 point. **PyDigest2 agrees with digest2 considerably
+more closely than digest2 agrees with itself in production use.** The
+`repeatable` keyword pins the seed and is what both sides used for the
+comparison above; it is the only mode in which any two implementations can be
+compared at all.
 
 Re-running this validation (against your own C build) is straightforward and
 documented inline in `tests/test_integration.py` and `tests/test_cli.py`,
@@ -194,6 +212,12 @@ snapshot (reproduced with default config, restricted-class config, single- and
 multi-observation files — not something this port needs to reproduce).
 Worth flagging upstream; `pydigest2 -l ...` is implemented from the documented
 behavior and covered by tests.
+
+## Further reading
+
+[`docs/ALGORITHM.md`](docs/ALGORITHM.md) — how the algorithm works, step by
+step, cross-referenced to both the paper and the C source, including the
+places where the current C code has moved past the 2019 paper.
 
 ## Package layout
 
